@@ -61,7 +61,32 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #else
 #define REX_HAS_SIGEV_THREAD_ID 0
 #endif
+#include <cstdio>
 
+#if REX_PLATFORM_ANDROID
+static uint64_t FastCoreMask() {
+  static const uint64_t mask = [] {
+    unsigned long freq[64] = {};
+    unsigned long max_f = 0;
+    long n = std::min<long>(sysconf(_SC_NPROCESSORS_CONF), 64);
+    for (long i = 0; i < n; i++) {
+      char p[96];
+      snprintf(p, sizeof(p),
+               "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", i);
+      if (FILE* f = fopen(p, "r")) {
+        if (fscanf(f, "%lu", &freq[i]) != 1) freq[i] = 0;
+        fclose(f);
+      }
+      max_f = std::max(max_f, freq[i]);
+    }
+    uint64_t m = 0;
+    for (long i = 0; i < n; i++)
+      if (max_f && freq[i] * 100 >= max_f * 85) m |= 1ULL << i;
+    return m;
+  }();
+  return mask;
+}
+#endif
 namespace rex::thread {
 
 #if REX_PLATFORM_ANDROID
@@ -747,8 +772,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
       }
     }
 #if REX_PLATFORM_ANDROID
-    if (sched_setaffinity(pthread_gettid_np(thread_), sizeof(cpu_set_t), &cpu_set) != 0) {
-      assert_always();
+    if (uint64_t fast = FastCoreMask()) {
+      CPU_ZERO(&cpu_set);
+      for (auto i = 0u; i < 64; i++)
+        if (fast & (1ULL << i)) CPU_SET(i, &cpu_set);
+    }
+    if (sched_setaffinity(pthread_gettid_np(thread_), sizeof(cpu_set_t),
+                          &cpu_set) != 0) {
+      return;
     }
 #else
     if (pthread_setaffinity_np(thread_, sizeof(cpu_set_t), &cpu_set) != 0) {
